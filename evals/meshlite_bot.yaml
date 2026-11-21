@@ -1,0 +1,33 @@
+# Behavioral evals of examples/bot.py. Start the bot (`uv run examples/bot.py`), then:
+#   cd evals && pipecat eval run meshlite_bot.yaml -v
+name: meshlite_bot
+
+judge:
+  eval:
+    factory: azure_judge.judge
+    model: gpt-5.4-mini
+
+scenarios:
+  - name: greets_and_answers
+    turns:
+      - expect:
+          - event: response
+            eval: "the bot opens the conversation with a short greeting"
+      - user: "What is the capital of France?"
+        expect:
+          - event: response
+            eval: "the response says the capital of France is Paris"
+
+  - name: interruption
+    turns:
+      - expect:
+          - event: response
+      - user: "Tell me a long, detailed story about the history of Paris."
+        expect:
+          - event: llm_started
+      - user: "Actually, never mind that. What's the capital of Japan?"
+        send_after: { event: llm_started, delay_ms: 2000 }
+        expect:
+          - event: bot_interrupted
+          - event: response
+            eval: "says Tokyo instead of continuing the Paris story"

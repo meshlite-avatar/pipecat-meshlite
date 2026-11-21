@@ -1,0 +1,97 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pipecat-meshlite"
+dynamic = ["version"]
+description = "MeshLite avatar face for Pipecat bots: lip-synced in the visitor's browser from the bot's own audio track"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+# pipecat-ai needs Python 3.11 or later since 1.0.
+requires-python = ">=3.11"
+authors = [{ name = "Toda Labs (MeshLite)", email = "contact@meshlite.io" }]
+keywords = ["pipecat", "avatar", "lip-sync", "voice-agent", "webrtc", "meshlite"]
+classifiers = [
+    "Intended Audience :: Developers",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3 :: Only",
+    "Typing :: Typed",
+]
+dependencies = [
+    "pipecat-ai>=1.15.0,<2",
+    # pipecat-ai already depends on aiohttp; named here because this package calls it directly.
+    "aiohttp>=3.9",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.2",
+    "pytest-asyncio>=1.1",
+    "pytest-aiohttp>=1.1",
+]
+example = [
+    "pipecat-ai[webrtc,silero,azure,runner]>=1.15.0,<2",
+    "python-dotenv>=1.0",
+]
+eval = [
+    "pipecat-ai[cli,azure]>=1.16.0,<2",
+]
+
+[project.urls]
+Documentation = "https://meshlite.io/docs#pipecat"
+Website = "https://meshlite.io"
+Source = "https://github.com/meshlite-avatar/pipecat-meshlite"
+Changelog = "https://github.com/meshlite-avatar/pipecat-meshlite/blob/main/CHANGELOG.md"
+
+[tool.hatch.version]
+path = "src/pipecat_meshlite/version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pipecat_meshlite"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/pipecat_meshlite",
+    "tests/*.py",
+    "examples/bot.py",
+    "examples/env.example",
+    "evals/*.py",
+    "evals/*.yaml",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+]
+exclude = ["**/.env", "**/*.eval.log"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = [
+    # pipecat-ai imports the stdlib audioop on Python 3.11 and 3.12; not ours to fix.
+    "ignore:'audioop' is deprecated:DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "D", "B", "UP"]
+ignore = ["D105", "D107"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D"]
+# The visitor page is an HTML string: its lines follow the page, not Python.
+"examples/bot.py" = ["E501"]
