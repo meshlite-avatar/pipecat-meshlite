@@ -1,18 +1,24 @@
 import pytest
 from conftest import PK, SK
 from pipecat.frames.frames import (
+    ErrorCategory,
     ErrorFrame,
     InterruptionFrame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    LLMTextFrame,
     STTUpdateSettingsFrame,
     TTSAudioRawFrame,
     TTSUpdateSettingsFrame,
 )
+from pipecat.pipeline.pipeline import Pipeline
 from pipecat.processors.frameworks.rtvi import (
     RTVIClientMessageFrame,
     RTVIServerMessageFrame,
     RTVIServerResponseFrame,
 )
 from pipecat.services.settings import STTSettings, TTSSettings
+from pipecat.services.tts_service import TTSService
 from pipecat.tests.utils import SleepFrame, run_test
 from pipecat.transcriptions.language import Language
 
@@ -111,6 +117,35 @@ async def test_refusal_answers_with_an_error_and_a_non_fatal_error_frame(meshlit
     assert processor.sessions_created == 0
 
 
+async def test_refusals_count_toward_the_session_limit(meshlite):
+    meshlite.status = 403
+    down, _ = await run_test(
+        make_processor(meshlite, max_sessions=2),
+        frames_to_send=[request("1"), SleepFrame(0.3), request("2"), SleepFrame(0.3), request("3")]
+        + [SleepFrame(0.2)],
+        expected_down_frames=[RTVIServerResponseFrame] * 3,
+        ignore_start=True,
+    )
+    assert [frame.error for frame in down] == [
+        "meshlite_session_refused:ORIGIN_NOT_ALLOWED",
+        "meshlite_session_refused:ORIGIN_NOT_ALLOWED",
+        "meshlite_session_limit",
+    ]
+    assert len(meshlite.requests) == 2
+
+
+@pytest.mark.parametrize(("status", "kind"), [(429, "unavailable"), (503, "unavailable")])
+async def test_temporary_failures_tell_the_page_to_try_again(meshlite, status, kind):
+    meshlite.status = status
+    down, _ = await run_test(
+        make_processor(meshlite),
+        frames_to_send=[request(), SleepFrame(0.5)],
+        expected_down_frames=[RTVIServerResponseFrame],
+        expected_up_frames=[ErrorFrame],
+    )
+    assert down[0].error.startswith(f"meshlite_session_{kind}:")
+
+
 async def test_limits_sessions_per_connection(meshlite):
     down, _ = await run_test(
         make_processor(meshlite, max_sessions=1),
@@ -122,10 +157,10 @@ async def test_limits_sessions_per_connection(meshlite):
     assert len(meshlite.requests) == 1
 
 
-async def test_tells_the_page_when_the_language_changes(meshlite):
+async def test_follows_a_voice_settings_frame_when_placed_before_the_tts(meshlite):
     to_french = TTSUpdateSettingsFrame(delta=TTSSettings(language=Language.FR_FR))
-    still_french = STTUpdateSettingsFrame(delta=STTSettings(language=Language.FR))
-    to_spanish = STTUpdateSettingsFrame(settings={"language": "es"})
+    still_french = TTSUpdateSettingsFrame(settings={"language": "fr"})
+    to_spanish = TTSUpdateSettingsFrame(settings={"language": "es"})
     voice_only = TTSUpdateSettingsFrame(delta=TTSSettings(voice="alice"))
     down, _ = await run_test(
         make_processor(meshlite, language="en"),
@@ -133,15 +168,24 @@ async def test_tells_the_page_when_the_language_changes(meshlite):
         expected_down_frames=[
             RTVIServerMessageFrame,
             TTSUpdateSettingsFrame,
-            STTUpdateSettingsFrame,
+            TTSUpdateSettingsFrame,
             RTVIServerMessageFrame,
-            STTUpdateSettingsFrame,
+            TTSUpdateSettingsFrame,
             TTSUpdateSettingsFrame,
         ],
     )
     assert down[0].data == {"type": "meshlite-language", "language": "fr"}
     assert down[3].data == {"type": "meshlite-language", "language": "auto"}
     assert down[1] is to_french
+
+
+async def test_the_visitors_speech_to_text_language_is_not_followed(meshlite):
+    # The lips follow the bot's voice, not what the visitor's STT is set to.
+    await run_test(
+        make_processor(meshlite, language="en"),
+        frames_to_send=[STTUpdateSettingsFrame(delta=STTSettings(language=Language.FR))],
+        expected_down_frames=[STTUpdateSettingsFrame],
+    )
 
 
 async def test_language_following_can_be_turned_off(meshlite):
@@ -175,3 +219,96 @@ async def test_refusal_never_makes_the_processor_unusable(meshlite, status):
     )
     assert processor.is_usable
     assert down[1] is audio
+
+
+class _SilentTTS(TTSService):
+    """A real TTSService: it consumes settings frames and pushes TTSTextFrame."""
+
+    def __init__(self):
+        super().__init__(
+            sample_rate=16000, settings=TTSSettings(model=None, voice=None, language=None)
+        )
+
+    def can_generate_metrics(self):
+        return False
+
+    async def run_tts(self, text, context_id):
+        yield TTSAudioRawFrame(
+            audio=b"\0\0" * 160, sample_rate=16000, num_channels=1, context_id=context_id
+        )
+
+
+def reply(*sentences):
+    return [
+        LLMFullResponseStartFrame(),
+        *(LLMTextFrame(sentence) for sentence in sentences),
+        LLMFullResponseEndFrame(),
+        SleepFrame(0.2),
+    ]
+
+
+def languages_sent(frames):
+    return [
+        frame.data["language"]
+        for frame in frames
+        if isinstance(frame, RTVIServerMessageFrame)
+        and frame.data.get("type") == "meshlite-language"
+    ]
+
+
+async def test_lips_follow_the_language_the_bot_speaks_behind_a_real_tts(meshlite):
+    processor = make_processor(meshlite, language=Language.EN)
+    down, _ = await run_test(
+        Pipeline([_SilentTTS(), processor]),
+        frames_to_send=[
+            *reply("Hello, I am happy to help you with this question. "),
+            *reply("Bonjour, je suis très content de vous aider. ", "C'est une bonne question."),
+            *reply("Merci, et bonne journée à vous. "),
+            *reply("你好，我很高兴帮助你回答这个问题。"),
+            *reply("Thanks, it is very well done and I can help you. "),
+        ],
+    )
+    assert languages_sent(down) == ["fr", "zh-CN", "en"]
+    assert processor.language == "en"
+
+
+async def test_short_or_mixed_replies_keep_the_lips(meshlite):
+    processor = make_processor(meshlite, language=Language.FR)
+    down, _ = await run_test(
+        Pipeline([_SilentTTS(), processor]),
+        frames_to_send=[*reply("OK. "), *reply("Hola, ¿cómo estás hoy? "), *reply("Yes, oui. ")],
+    )
+    assert languages_sent(down) == []
+
+
+async def test_settings_frame_is_swallowed_but_set_language_works(meshlite):
+    processor = make_processor(meshlite, language=Language.EN)
+    tts = _SilentTTS()
+    down, _ = await run_test(
+        Pipeline([tts, processor]),
+        frames_to_send=[
+            TTSUpdateSettingsFrame(delta=TTSSettings(language=Language.FR)),
+            SleepFrame(0.1),
+        ],
+    )
+    assert languages_sent(down) == []
+    sent = []
+
+    async def capture(frame, direction=None):
+        sent.append(frame)
+
+    processor.push_frame = capture
+    await processor.set_language("fr-FR")
+    await processor.set_language(Language.FR)
+    assert languages_sent(sent) == ["fr"]
+
+
+async def test_a_402_is_a_quota_error(meshlite):
+    meshlite.status = 402
+    _, up = await run_test(
+        make_processor(meshlite),
+        frames_to_send=[request(), SleepFrame(0.5)],
+        expected_down_frames=[RTVIServerResponseFrame],
+        expected_up_frames=[ErrorFrame],
+    )
+    assert up[0].category is ErrorCategory.QUOTA

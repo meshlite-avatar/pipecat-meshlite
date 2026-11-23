@@ -124,7 +124,9 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     @transport.event_handler("on_client_connected")
     async def on_client_connected(_transport, _client):
         logger.info("Visitor connected")
-        context.add_message({"role": "developer", "content": "Greet the visitor in one short sentence."})
+        context.add_message(
+            {"role": "developer", "content": "Greet the visitor in one short sentence."}
+        )
         await worker.queue_frames([LLMRunFrame()])
 
     @transport.event_handler("on_client_disconnected")
@@ -193,10 +195,17 @@ PAGE = """<!doctype html>
     avatar = MeshLite.mount({
       container: "#avatar", avatar: CONFIG.avatar, publishableKey: CONFIG.publishableKey, audio: "track",
       // The bot creates the MeshLite session (pipecat-meshlite, "meshlite-session").
+      // Stays under the SDK's 15 s wait: at most 4 s for the bot, then 10 s for the session.
       sessionToken: async () => {
-        await ready;
-        const reply = await client.sendClientRequest("meshlite-session", {}, 15000);
-        return (reply?.d ?? reply).sessionToken;
+        await Promise.race([ready, new Promise((_, fail) => setTimeout(() => fail(new Error("bot not ready")), 4000))]);
+        try {
+          const reply = await client.sendClientRequest("meshlite-session", {}, 10000);
+          return (reply?.d ?? reply).sessionToken;
+        } catch (e) {
+          const error = e?.data?.error ?? e?.message ?? String(e);
+          // A refusal or the session limit will not change: the SDK must not ask again.
+          throw Object.assign(new Error(error), { retryable: !/^meshlite_session_(refused|limit)/.test(error) });
+        }
       },
     });
     link = avatar.attachPipecat(client); // before connect, so no speech is missed
@@ -229,7 +238,8 @@ async def page():
     """Serve the visitor page with the MeshLite SDK and the public MeshLite settings."""
     config = {
         "publishableKey": os.getenv("MESHLITE_PUBLISHABLE_KEY", ""),
-        "avatar": os.getenv("MESHLITE_AVATAR") or None,
+        # Required: the page and the session must use the same avatar.
+        "avatar": os.environ["MESHLITE_AVATAR"],
     }
     html = PAGE.replace("__SDK__", f"{MESHLITE_API}/sdk/{MESHLITE_SDK_VERSION}/meshlite.js")
     html = html.replace("__CONFIG__", json.dumps(config))

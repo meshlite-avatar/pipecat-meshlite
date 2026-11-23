@@ -88,6 +88,13 @@ def _key_environment(key: str, kind: str, name: str) -> str:
     return match.group(2)
 
 
+def _sends_key_in_clear(api_url: str) -> bool:
+    if not api_url.lower().startswith("http://"):
+        return False
+    host = api_url[len("http://") :].split("/", 1)[0].rsplit(":", 1)[0].strip("[]").lower()
+    return host not in {"localhost", "127.0.0.1", "::1"} and not host.endswith(".localhost")
+
+
 def _error_code(payload: Any) -> str | None:
     """Return MeshLite's error code: ``{"error": {"code": ...}}`` or ``{"code": ...}``."""
     if not isinstance(payload, dict):
@@ -151,7 +158,7 @@ class MeshLiteClient:
         avatar: str | None = None,
         api_url: str | None = None,
         aiohttp_session: aiohttp.ClientSession | None = None,
-        timeout: float = 15.0,
+        timeout: float = 8.0,
     ):
         """Initialize the client.
 
@@ -168,7 +175,8 @@ class MeshLiteClient:
                 ``https://console.meshlite.io``.
             aiohttp_session: Optional shared HTTP session. When omitted, the client opens
                 its own and closes it in :meth:`close`.
-            timeout: Timeout, in seconds, of one session request.
+            timeout: Timeout, in seconds, of one session request. The default stays
+                well under the web SDK's 15 s wait for a session token.
 
         Raises:
             ValueError: If a key is missing or malformed, if the two keys belong to
@@ -196,6 +204,11 @@ class MeshLiteClient:
         self._origin = normalize_origin(origin)
         self._avatar = (avatar or os.environ.get("MESHLITE_AVATAR", "")).strip() or None
         self._api_url = (api_url or os.environ.get("MESHLITE_API") or DEFAULT_API_URL).rstrip("/")
+        if _sends_key_in_clear(self._api_url):
+            logger.warning(
+                "MeshLite API URL uses http:// outside localhost: the secret key would travel "
+                "unencrypted. Use https://."
+            )
         self._timeout = aiohttp.ClientTimeout(total=timeout)
         self._session = aiohttp_session
         self._owns_session = aiohttp_session is None

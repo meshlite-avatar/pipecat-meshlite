@@ -132,3 +132,26 @@ async def test_reads_a_flat_error_code(meshlite):
         with pytest.raises(MeshLiteError) as caught:
             await client.create_session()
     assert caught.value.code == "SDK_UPGRADE_REQUIRED"
+
+
+@pytest.mark.parametrize(
+    ("api_url", "warns"),
+    [
+        ("http://api.example.com", True),
+        ("http://localhost:8080", False),
+        ("http://127.0.0.1:8080/", False),
+        ("https://console.meshlite.io", False),
+    ],
+)
+def test_warns_when_the_secret_key_would_travel_in_clear(api_url, warns):
+    from loguru import logger
+
+    messages = []
+    sink = logger.add(lambda message: messages.append(str(message)), level="WARNING")
+    try:
+        MeshLiteClient(
+            publishable_key=PK, secret_key=SK, origin="http://localhost", api_url=api_url
+        )
+    finally:
+        logger.remove(sink)
+    assert any("http://" in message for message in messages) is warns

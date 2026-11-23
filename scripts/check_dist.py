@@ -11,22 +11,28 @@ import tarfile
 import zipfile
 from pathlib import Path
 
-PACKAGE = r"pipecat_meshlite/(__init__|client|languages|processor|version)\.py|pipecat_meshlite/py\.typed"
+PACKAGE = (
+    r"pipecat_meshlite/(__init__|client|languages|processor|version)\.py"
+    r"|pipecat_meshlite/py\.typed"
+)
 WHEEL_OK = re.compile(
     rf"^({PACKAGE}|pipecat_meshlite-[^/]+\.dist-info/(METADATA|WHEEL|RECORD|licenses/LICENSE))$"
 )
 SECRET = re.compile(
-    rb"ml_(sk|pk)_(live|test)_[A-Za-z0-9]{12,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|AKIA[0-9A-Z]{16}"
+    rb"ml_(sk|pk)_(live|test)_[A-Za-z0-9_-]{12,}"
+    rb"|-----BEGIN [A-Z ]*PRIVATE KEY-----|AKIA[0-9A-Z]{16}"
     rb"|sk-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{20,}|pypi-[A-Za-z0-9_-]{20,}|[0-9a-f]{32}|[A-Za-z0-9]{84}"
 )
 
 
 def version() -> str:
+    """Return the package version written in ``version.py``."""
     text = Path("src/pipecat_meshlite/version.py").read_text(encoding="utf-8")
     return re.search(r'__version__ = "([^"]+)"', text).group(1)
 
 
 def main() -> int:
+    """Check the archives in the dist folder; return 1 and print why if one fails."""
     args = sys.argv[1:]
     dist = Path(args[0] if args else "dist")
     tag = args[args.index("--tag") + 1] if "--tag" in args else None

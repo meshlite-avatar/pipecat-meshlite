@@ -46,7 +46,7 @@ In the [MeshLite Console](https://console.meshlite.io) (Projects, then **For dev
 | `MESHLITE_PUBLISHABLE_KEY` | yes | `ml_pk_test_...` or `ml_pk_live_...` (also sent to the page) |
 | `MESHLITE_SECRET_KEY` | yes | `ml_sk_...` of the same environment; stays on your server |
 | `MESHLITE_ORIGIN` | yes | address of your page, for example `https://www.example.com` |
-| `MESHLITE_AVATAR` | no | avatar id; without it, the plan's default avatar |
+| `MESHLITE_AVATAR` | recommended | avatar id; the page must mount the same one (the example requires it). Without it, sessions get the plan's default avatar |
 | `MESHLITE_API` | no | another MeshLite environment (default `https://console.meshlite.io`) |
 
 ## Usage
@@ -54,6 +54,7 @@ In the [MeshLite Console](https://console.meshlite.io) (Projects, then **For dev
 ### 1. The bot: add the processor
 
 ```python
+from pipecat.pipeline.pipeline import Pipeline
 from pipecat.transcriptions.language import Language
 from pipecat_meshlite import MeshLiteAvatarProcessor
 
@@ -65,27 +66,34 @@ pipeline = Pipeline([
     user_aggregator,
     llm,
     tts,
-    avatar,              # anywhere works; right before the output is a good place
+    avatar,              # after the TTS: it reads what the bot says
     transport.output(),
     assistant_aggregator,
 ])
 ```
 
-RTVI must be on (the default of `PipelineWorker`). Any Pipecat transport that reaches a
-browser works: SmallWebRTC, Daily, LiveKit.
+RTVI must be on (the default of `PipelineWorker`). Tested with the SmallWebRTC transport;
+the processor only uses RTVI messages, so other browser transports should work too.
+
+**Lip language.** The processor reads the words the bot speaks (`TTSTextFrame`). As soon
+as a reply is clearly in English, French or Mandarin and differs from the current lip
+model, it sends `meshlite-language` to the page. A bot that switches language on purpose
+can call `await avatar.set_language("fr")`. The lips follow the bot's voice, not the
+visitor's speech-to-text.
 
 | Parameter | Default | Meaning |
 |---|---|---|
 | `client` | from the environment | a `MeshLiteClient` (keys, origin, avatar, API) |
 | `avatar` | client's avatar | avatar id for this bot |
 | `language` | `None` | language the bot speaks; picks the lip model (`en`, `fr`, `zh-CN`, else `auto`) |
-| `max_sessions` | `3` | most MeshLite sessions per connection (each one counts as a conversation) |
-| `follow_language` | `True` | send `meshlite-language` when a `TTSUpdateSettingsFrame` or `STTUpdateSettingsFrame` changes the language |
+| `max_sessions` | `3` | most session requests to MeshLite per connection, refusals included (each session counts as a conversation) |
+| `follow_language` | `True` | send `meshlite-language` when the language the bot speaks changes |
 
 Event handlers: `on_session_created(processor, session)` and
 `on_session_error(processor, error)`. If MeshLite refuses a session, the page gets an
-error response, the processor pushes a non-fatal `ErrorFrame`, and the visitor keeps
-hearing the bot without the face.
+error response (`meshlite_session_refused:<code>`, final, or
+`meshlite_session_unavailable:<code>`, worth another try), the processor pushes a
+non-fatal `ErrorFrame`, and the visitor keeps hearing the bot without the face.
 
 ### 2. The page: mount the face and attach the Pipecat client
 
@@ -107,10 +115,17 @@ hearing the bot without the face.
   });
   const avatar = MeshLite.mount({
     container: "#avatar", avatar: "your-avatar-id", publishableKey: "ml_pk_live_...", audio: "track",
+    // Stays under the SDK's 15 s wait: at most 4 s for the bot, then 10 s for the session.
     sessionToken: async () => {
-      await ready;
-      const reply = await client.sendClientRequest("meshlite-session", {}, 15000);
-      return (reply?.d ?? reply).sessionToken;
+      await Promise.race([ready, new Promise((_, fail) => setTimeout(() => fail(new Error("bot not ready")), 4000))]);
+      try {
+        const reply = await client.sendClientRequest("meshlite-session", {}, 10000);
+        return (reply?.d ?? reply).sessionToken;
+      } catch (e) {
+        const error = e?.data?.error ?? e?.message ?? String(e);
+        // A refusal or the session limit will not change: the SDK must not ask again.
+        throw Object.assign(new Error(error), { retryable: !/^meshlite_session_(refused|limit)/.test(error) });
+      }
     },
   });
   avatar.attachPipecat(client);              // before connect, so no speech is missed

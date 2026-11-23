@@ -14,7 +14,9 @@ from loguru import logger
 from pipecat.frames.frames import (
     ErrorCategory,
     Frame,
-    STTUpdateSettingsFrame,
+    InterruptionFrame,
+    LLMFullResponseStartFrame,
+    TTSTextFrame,
     TTSUpdateSettingsFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
@@ -27,7 +29,7 @@ from pipecat.services.settings import is_given
 from pipecat.transcriptions.language import Language
 
 from pipecat_meshlite.client import MeshLiteClient, MeshLiteError
-from pipecat_meshlite.languages import to_meshlite_language
+from pipecat_meshlite.languages import spoken_language_of, to_meshlite_language
 
 SESSION_REQUEST = "meshlite-session"
 """RTVI client request type the page sends to get its MeshLite session."""
@@ -39,23 +41,30 @@ LANGUAGE_MESSAGE = "meshlite-language"
 class MeshLiteAvatarProcessor(FrameProcessor):
     """Gives the bot's client page its MeshLite session and keeps its lips in the right language.
 
-    Place it anywhere in the pipeline, for example right before ``transport.output()``.
-    Every frame passes through unchanged, except the page's ``meshlite-session``
-    requests, which it answers.
+    Place it after the TTS service, for example right before ``transport.output()``: it
+    reads the text the TTS pushes. Every frame passes through unchanged, except the page's
+    ``meshlite-session`` requests, which it answers.
 
     1. **Session over RTVI.** The page asks with
        ``client.sendClientRequest("meshlite-session", {})``. The processor creates a
        MeshLite client session (``audio: "track"``) with the server-side secret key and
        answers with ``{sessionToken, publishableKey, avatar, language}``. The page needs no
        endpoint of its own, and a session exists only for a connected bot. At most
-       ``max_sessions`` sessions are created per connection (the SDK asks again only to
-       renew one).
-    2. **Lip language.** When the bot's voice or speech-to-text changes language
-       (``TTSUpdateSettingsFrame`` or ``STTUpdateSettingsFrame``), it sends the RTVI server
-       message ``{"type": "meshlite-language", "language": "fr"}``; the page calls
-       ``avatar.setLanguage(language)`` so the lip model follows.
+       ``max_sessions`` requests are sent to MeshLite per connection, refusals included
+       (the SDK asks again only to renew a session or after a temporary failure).
+    2. **Lip language.** Like the MeshLite web SDK with its own voice, it reads the words
+       the bot speaks (``TTSTextFrame``, pushed by the TTS service) and, as soon as the
+       current reply is clearly in another language (English, French or Mandarin), sends
+       the RTVI server message ``{"type": "meshlite-language", "language": "fr"}``; the page
+       calls ``avatar.setLanguage(language)`` and the lip model of that language takes over
+       between two replies. A bot that switches on purpose can also call
+       :meth:`set_language`. The lips follow the bot's voice, never the visitor's
+       speech-to-text. A ``TTSUpdateSettingsFrame`` is followed only when the processor
+       sits before the TTS service, which consumes it.
 
-    If MeshLite refuses a session, the page gets an error response and the processor
+    If MeshLite refuses a session, the page gets an error response
+    (``meshlite_session_refused:<code>``, final, or ``meshlite_session_unavailable:<code>``
+    for a network error, 429 or 5xx, worth another try) and the processor
     pushes a non-fatal, non-permanent ``ErrorFrame``: the processor stays usable, the bot
     keeps talking and the SDK plays its voice without the face.
 
@@ -91,7 +100,8 @@ class MeshLiteAvatarProcessor(FrameProcessor):
             avatar: Avatar id. Defaults to the client's avatar.
             language: The language the bot speaks at the start. It picks the lip model
                 of each new session.
-            max_sessions: Most sessions created for one connection (1 to 10).
+            max_sessions: Most session requests sent to MeshLite for one connection,
+                refusals included (1 to 10).
             follow_language: Whether to tell the page when the bot's language changes.
             **kwargs: Passed to :class:`~pipecat.processors.frame_processor.FrameProcessor`.
 
@@ -109,6 +119,8 @@ class MeshLiteAvatarProcessor(FrameProcessor):
         self._max_sessions = max_sessions
         self._follow_language = follow_language
         self._sessions_created = 0
+        self._attempts = 0
+        self._reply = ""
         self._tasks: set = set()
         self._register_event_handler("on_session_created")
         self._register_event_handler("on_session_error")
@@ -139,10 +151,16 @@ class MeshLiteAvatarProcessor(FrameProcessor):
             task.add_done_callback(self._tasks.discard)
             return
 
-        if self._follow_language and isinstance(
-            frame, (TTSUpdateSettingsFrame, STTUpdateSettingsFrame)
-        ):
-            await self._follow(frame)
+        if self._follow_language:
+            if isinstance(frame, (LLMFullResponseStartFrame, InterruptionFrame)):
+                self._reply = ""
+            elif isinstance(frame, TTSTextFrame) and direction == FrameDirection.DOWNSTREAM:
+                self._reply = f"{self._reply} {frame.text}".strip()[-2000:]
+                spoken = spoken_language_of(self._reply)
+                if spoken is not None:
+                    await self.set_language(spoken)
+            elif isinstance(frame, TTSUpdateSettingsFrame):
+                await self._follow(frame)
 
         await self.push_frame(frame, direction)
 
@@ -156,23 +174,25 @@ class MeshLiteAvatarProcessor(FrameProcessor):
             await self._client.close()
 
     async def _answer_session_request(self, request: RTVIClientMessageFrame):
-        if self._sessions_created >= self._max_sessions:
+        if self._attempts >= self._max_sessions:
             logger.warning(f"{self}: MeshLite session limit reached ({self._max_sessions}).")
             await self.push_frame(
                 RTVIServerResponseFrame(client_msg=request, error="meshlite_session_limit")
             )
             return
 
-        self._sessions_created += 1
+        # Refusals count too: a page that keeps asking, or a wrong setting such as
+        # ORIGIN_NOT_ALLOWED, cannot send MeshLite more than max_sessions requests.
+        self._attempts += 1
         try:
             session = await self._client.create_session(
                 avatar=self._avatar, language=self._language
             )
         except MeshLiteError as error:
-            self._sessions_created -= 1
+            kind = "unavailable" if error.retryable else "refused"
             await self.push_frame(
                 RTVIServerResponseFrame(
-                    client_msg=request, error=f"meshlite_session_refused:{error.code}"
+                    client_msg=request, error=f"meshlite_session_{kind}:{error.code}"
                 )
             )
             await self._call_event_handler("on_session_error", error)
@@ -183,15 +203,18 @@ class MeshLiteAvatarProcessor(FrameProcessor):
             )
             return
 
+        self._sessions_created += 1
         await self.push_frame(RTVIServerResponseFrame(client_msg=request, data=session.to_client()))
         await self._call_event_handler("on_session_created", session)
 
-    async def _follow(self, frame: TTSUpdateSettingsFrame | STTUpdateSettingsFrame):
-        language = None
-        if frame.delta is not None and is_given(frame.delta.language):
-            language = frame.delta.language
-        elif "language" in frame.settings:
-            language = frame.settings["language"]
+    async def set_language(self, language: Language | str) -> None:
+        """Tell the page that the bot now speaks ``language``, so the lips follow.
+
+        Nothing is sent when the lip model does not change.
+
+        Args:
+            language: A Pipecat language or a BCP-47 code such as ``"fr-FR"``.
+        """
         meshlite_language = to_meshlite_language(language)
         if meshlite_language is None or meshlite_language == self._language:
             return
@@ -199,6 +222,15 @@ class MeshLiteAvatarProcessor(FrameProcessor):
         await self.push_frame(
             RTVIServerMessageFrame(data={"type": LANGUAGE_MESSAGE, "language": meshlite_language})
         )
+
+    async def _follow(self, frame: TTSUpdateSettingsFrame):
+        language = None
+        if frame.delta is not None and is_given(frame.delta.language):
+            language = frame.delta.language
+        elif "language" in frame.settings:
+            language = frame.settings["language"]
+        if language is not None:
+            await self.set_language(language)
 
     @staticmethod
     def _category(error: MeshLiteError) -> ErrorCategory:
@@ -212,4 +244,6 @@ class MeshLiteAvatarProcessor(FrameProcessor):
             return ErrorCategory.RATE_LIMIT
         if error.status >= 500:
             return ErrorCategory.SERVER
+        if error.status == 402:
+            return ErrorCategory.QUOTA
         return ErrorCategory.APPLICATION
