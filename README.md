@@ -168,9 +168,10 @@ uv run examples/bot.py
 ```
 
 Open http://localhost:7860, press **Start** and allow the microphone. The face greets you
-and answers with matching lips. Interrupt it by speaking: it stops at once. The voice
-starts through the face about 0.8 s after it reaches the page (a live track has no
-"segment ready" signal); until the face is ready, the page plays the voice itself.
+and answers with matching lips. Interrupt it by speaking: it stops at once. The face
+starts once it has received a little of the voice (a live track has no "segment ready"
+signal); until the face is ready, the page plays the voice itself, so the conversation
+starts without waiting for the face.
 
 Any other Pipecat services work the same way: the processor does not depend on them.
 
@@ -198,8 +199,6 @@ uv run pytest
 - One lip model per language: English, French, Mandarin Chinese. Other languages use the
   avatar's own language model.
 - A MeshLite session lasts at most 2 hours and counts as one conversation of your plan.
-- The face starts about 0.8 s after the first voice; the whole reply is delayed by that
-  start-up time once the face carries the voice.
 
 ## License
 
